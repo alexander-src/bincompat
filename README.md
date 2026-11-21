@@ -10,7 +10,7 @@ When a binary built on a newer Linux distribution accidentally pulls in a single
 
 ## Current Capabilities (Milestone 1)
 
-- **Zero external crates:** builds offline in ~1 second; 100% safe Rust (`#![forbid(unsafe_code)]`).
+- **Zero external crates:** builds offline in ~1 second (`400 KB` stripped release binary); 100% safe Rust (`#![forbid(unsafe_code)]`).
 - **Exact symbol attribution:** joins `.dynsym`, `.gnu.version` (masking the `0x8000` hidden bit), and `.gnu.version_r` to map every offending undefined symbol to its shared library and version tag.
 - **ABI tag awareness:** detects zero-symbol linker ABI tags such as `GLIBC_ABI_DT_RELR` and `GLIBC_PRIVATE` instead of silently dropping them.
 - **Dynamic dependency inspection:** reports `PT_INTERP`, `DT_NEEDED`, `DT_SONAME`, `DT_RPATH`, and `DT_RUNPATH`.
@@ -31,6 +31,27 @@ cargo build --release
   --max-glibcxx 3.4.28 \
   --forbid-abi-tag GLIBC_ABI_DT_RELR \
   --forbid-rpath
+```
+
+## Example Output (`check --max-glibc 2.34 --forbid-abi-tag GLIBC_ABI_DT_RELR`)
+
+```text
+bincompat scan: /usr/bin/env
+  elf           : ET_DYN (x86-64, ELF64-LE)
+  linking       : dynamic
+  interpreter   : /lib64/ld-linux-x86-64.so.2
+  needed        : libc.so.6
+  max-versions  : GLIBC_2.43
+  abi-tags      : GLIBC_ABI_DT_RELR (libc.so.6)
+
+Policy Status: FAIL (rules: GLIBC<=2.34, forbid-abi-tag=GLIBC_ABI_DT_RELR, violations: 3)
+
+Violations:
+  [VERSION] GLIBC_2.43 (libc.so.6) exceeds max GLIBC 2.34 (found 2.43, 1 symbol(s)):
+    - __memset_explicit_chk@GLIBC_2.43
+  [VERSION] GLIBC_2.38 (libc.so.6) exceeds max GLIBC 2.34 (found 2.38, 1 symbol(s)):
+    - __isoc23_strtol@GLIBC_2.38
+  [ABI-TAG] forbidden tag GLIBC_ABI_DT_RELR required by libc.so.6 (0 symbol(s))
 ```
 
 ## Documentation
