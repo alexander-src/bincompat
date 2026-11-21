@@ -1,61 +1,39 @@
 # bincompat
 
-Zero-dependency, `#![forbid(unsafe_code)]` Rust CLI and library that statically audits Linux ELF64 binaries for `GLIBC`/`GLIBCXX` symbol-version requirements, ABI feature tags (such as `GLIBC_ABI_DT_RELR`), and `DT_NEEDED`/`RPATH` portability constraints in CI.
+Static ELF64 scanner in zero-dependency safe Rust that maps Linux `GLIBC`/`GLIBCXX` version requirements and linker ABI tags back to the exact undefined symbols causing them.
 
-## Why bincompat?
+![demo](assets/demo.png)
 
-When a binary built on a newer Linux distribution accidentally pulls in a single newer symbol (such as `arc4random@GLIBC_2.36` or `std::__glibcxx_assert_fail@GLIBCXX_3.4.30`) or links with `-z pack-relative-relocs` (`GLIBC_ABI_DT_RELR`), it silently fails to start on older enterprise or LTS targets.
+## Why
 
-`bincompat` parses ELF64 dynamic tables (`SHT_DYNAMIC`, `SHT_DYNSYM`, `SHT_GNU_VERSYM`, `SHT_GNU_VERNEED`) directly in pure safe Rust and pinpoints the **exact undefined symbols** and **ABI feature tags** responsible for raising your minimum required runtime version.
+Ship a binary compiled on a newer Linux distro and it can fail to start on older LTS servers because one call pulled in `arc4random@GLIBC_2.36` or the linker emitted `GLIBC_ABI_DT_RELR` (`-z pack-relative-relocs`).
 
-## Current Capabilities (Milestone 1)
+`bincompat` reads `PT_INTERP`, `SHT_DYNAMIC`, `SHT_DYNSYM`, `SHT_GNU_VERSYM` (masking the `0x8000` hidden bit), and `SHT_GNU_VERNEED` directly, then fails CI with the exact library, version tag, and offending symbols.
 
-- **Zero external crates:** builds offline in ~1 second (`400 KB` stripped release binary); 100% safe Rust (`#![forbid(unsafe_code)]`).
-- **Exact symbol attribution:** joins `.dynsym`, `.gnu.version` (masking the `0x8000` hidden bit), and `.gnu.version_r` to map every offending undefined symbol to its shared library and version tag.
-- **ABI tag awareness:** detects zero-symbol linker ABI tags such as `GLIBC_ABI_DT_RELR` and `GLIBC_PRIVATE` instead of silently dropping them.
-- **Dynamic dependency inspection:** reports `PT_INTERP`, `DT_NEEDED`, `DT_SONAME`, `DT_RPATH`, and `DT_RUNPATH`.
-- **CI policy gating:** semantic exit codes (`0` pass, `1` policy violation, `2` error) with `--max-glibc`, `--max-glibcxx`, `--max-version PREFIX=VER`, `--forbid-abi-tag`, and `--forbid-rpath`.
-- **Verified against GNU `readelf`:** integration tests cross-check `bincompat` against live Linux system binaries and freshly compiled `g++` binaries alongside byte-by-byte ELF truncation fuzzing.
+## Usage
 
-## Quick Start
+Build from source (`cargo build --release`, ~1s offline, 400 KB stripped):
 
 ```bash
-cargo build --release
+# Inspect DT_NEEDED, RPATH/RUNPATH, max symbol versions, and ABI tags
+bincompat scan /usr/bin/env
 
-# Inspect ELF64 dynamic dependencies, max GLIBC/GLIBCXX versions, and ABI tags
-./target/release/bincompat scan /usr/bin/env
-
-# Fail CI if any symbol requires GLIBC > 2.28 or if GLIBC_ABI_DT_RELR is present
-./target/release/bincompat check ./build/app \
+# Fail CI if any symbol exceeds GLIBC 2.28 / GLIBCXX 3.4.28 or pulls in DT_RELR
+bincompat check ./build/app \
   --max-glibc 2.28 \
   --max-glibcxx 3.4.28 \
   --forbid-abi-tag GLIBC_ABI_DT_RELR \
   --forbid-rpath
 ```
 
-## Example Output (`check --max-glibc 2.34 --forbid-abi-tag GLIBC_ABI_DT_RELR`)
+Exit codes: `0` pass, `1` policy violation, `2` I/O or malformed ELF error.
 
-```text
-bincompat scan: /usr/bin/env
-  elf           : ET_DYN (x86-64, ELF64-LE)
-  linking       : dynamic
-  interpreter   : /lib64/ld-linux-x86-64.so.2
-  needed        : libc.so.6
-  max-versions  : GLIBC_2.43
-  abi-tags      : GLIBC_ABI_DT_RELR (libc.so.6)
+## Limitations
 
-Policy Status: FAIL (rules: GLIBC<=2.34, forbid-abi-tag=GLIBC_ABI_DT_RELR, violations: 3)
+- ELF64 only (no ELF32, PE, or Mach-O).
+- Static metadata scan only: does not catch symbols resolved dynamically via `dlopen`/`dlsym`.
+- Currently covers symbol versions, ABI tags, and dynamic paths (`DT_NEEDED`, `SONAME`, `RPATH`, `RUNPATH`). Binary hardening checks (`PIE`/`NX`/`RELRO`/stack canaries), distro tables, and `diff` mode are next.
 
-Violations:
-  [VERSION] GLIBC_2.43 (libc.so.6) exceeds max GLIBC 2.34 (found 2.43, 1 symbol(s)):
-    - __memset_explicit_chk@GLIBC_2.43
-  [VERSION] GLIBC_2.38 (libc.so.6) exceeds max GLIBC 2.34 (found 2.38, 1 symbol(s)):
-    - __isoc23_strtol@GLIBC_2.38
-  [ABI-TAG] forbidden tag GLIBC_ABI_DT_RELR required by libc.so.6 (0 symbol(s))
-```
+## License
 
-## Documentation
-
-- [Specification](docs/SPEC.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [License (MIT)](LICENSE)
+MIT. See [LICENSE](LICENSE).
