@@ -1,0 +1,18 @@
+[package]
+name = "bincompat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Zero-dependency safe Rust ELF64 Linux binary portability and hardening CI gate"
+license = "MIT"
+repository = "https://github.com/alexander-src/bincompat"
+homepage = "https://github.com/alexander-src/bincompat"
+keywords = ["elf64", "linux", "glibc", "binary-analysis", "portability"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
