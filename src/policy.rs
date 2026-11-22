@@ -1,24 +1,54 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::elf::{AttributedSymbol, BinaryAnalysis};
+use crate::elf::{AttributedSymbol, BinaryAnalysis, NxStatus, PieStatus, RelroStatus};
 use crate::error::{BincompatError, Result};
 use crate::version::{Version, VersionTag};
 
-/// Portability policy enforced by `bincompat check`.
+/// Portability and hardening policy enforced by `bincompat check`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Policy {
     pub max_versions: BTreeMap<String, Version>,
     pub forbid_abi_tags: BTreeSet<String>,
     pub forbid_rpath: bool,
+    pub require_pie: bool,
+    pub require_nx: bool,
+    pub min_relro: Option<RelroStatus>,
+    pub require_canary: bool,
 }
 
 impl Policy {
     pub fn is_empty(&self) -> bool {
-        self.max_versions.is_empty() && self.forbid_abi_tags.is_empty() && !self.forbid_rpath
+        self.max_versions.is_empty()
+            && self.forbid_abi_tags.is_empty()
+            && !self.forbid_rpath
+            && !self.require_pie
+            && !self.require_nx
+            && self.min_relro.is_none()
+            && !self.require_canary
     }
 
     pub fn set_max_version(&mut self, family: impl Into<String>, version: Version) {
         self.max_versions.insert(family.into(), version);
+    }
+
+    /// Enables standard Linux binary hardening checks: PIE, full RELRO, NX stack,
+    /// and stack canary.
+    pub fn enable_standard_hardening(&mut self) {
+        self.require_pie = true;
+        self.require_nx = true;
+        self.min_relro = Some(RelroStatus::Full);
+        self.require_canary = true;
+    }
+
+    /// Parses a RELRO level (`partial` or `full`) for `--require-relro`.
+    pub fn parse_relro_level(spec: &str) -> Result<RelroStatus> {
+        match spec.to_ascii_lowercase().as_str() {
+            "partial" => Ok(RelroStatus::Partial),
+            "full" => Ok(RelroStatus::Full),
+            _ => Err(BincompatError::InvalidArgument(format!(
+                "expected 'partial' or 'full' for --require-relro, got '{spec}'"
+            ))),
+        }
     }
 
     /// Parses a `PREFIX=VERSION` specification such as `CXXABI=1.3.11`.
@@ -88,6 +118,31 @@ impl Policy {
             }
         }
 
+        if self.require_pie && !analysis.hardening.pie.is_position_independent() {
+            violations.push(Violation::MissingPie {
+                actual: analysis.hardening.pie,
+            });
+        }
+
+        if let Some(required) = self.min_relro {
+            if analysis.hardening.relro < required {
+                violations.push(Violation::InsufficientRelro {
+                    actual: analysis.hardening.relro,
+                    required,
+                });
+            }
+        }
+
+        if self.require_nx && !analysis.hardening.nx.is_enabled() {
+            violations.push(Violation::MissingNx {
+                actual: analysis.hardening.nx,
+            });
+        }
+
+        if self.require_canary && !analysis.hardening.stack_canary {
+            violations.push(Violation::MissingStackCanary);
+        }
+
         PolicyEvaluation {
             passed: violations.is_empty(),
             violations,
@@ -95,7 +150,7 @@ impl Policy {
     }
 }
 
-/// Individual portability policy failure with exact symbol attribution.
+/// Individual portability or hardening policy failure with exact attribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Violation {
     VersionExceeded {
@@ -115,6 +170,17 @@ pub enum Violation {
         kind: String,
         value: String,
     },
+    MissingPie {
+        actual: PieStatus,
+    },
+    InsufficientRelro {
+        actual: RelroStatus,
+        required: RelroStatus,
+    },
+    MissingNx {
+        actual: NxStatus,
+    },
+    MissingStackCanary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,5 +202,19 @@ mod tests {
         assert!(Policy::parse_max_version_spec("GLIBC").is_err());
         assert!(Policy::parse_max_version_spec("=2.34").is_err());
         assert!(Policy::parse_max_version_spec("GLIBC=abc").is_err());
+    }
+
+    #[test]
+    fn parses_relro_levels() {
+        assert_eq!(
+            Policy::parse_relro_level("partial").unwrap(),
+            RelroStatus::Partial
+        );
+        assert_eq!(
+            Policy::parse_relro_level("FULL").unwrap(),
+            RelroStatus::Full
+        );
+        assert!(Policy::parse_relro_level("none").is_err());
+        assert!(Policy::parse_relro_level("strict").is_err());
     }
 }

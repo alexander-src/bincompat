@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use crate::elf::{AttributedSymbol, BinaryAnalysis, Endianness};
+use crate::elf::{AttributedSymbol, BinaryAnalysis, Endianness, RelroStatus};
 use crate::policy::{Policy, PolicyEvaluation, Violation};
 
 const SAMPLE_SYMBOL_LIMIT: usize = 6;
@@ -26,6 +26,18 @@ pub fn render_scan_text(path_label: &str, analysis: &BinaryAnalysis) -> String {
             "dynamic"
         } else {
             "static"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  hardening     : PIE={}, RELRO={}, NX={}, canary={}",
+        analysis.hardening.pie.as_str(),
+        analysis.hardening.relro.as_str(),
+        analysis.hardening.nx.as_str(),
+        if analysis.hardening.stack_canary {
+            "present"
+        } else {
+            "absent"
         }
     );
     if let Some(interp) = &analysis.interpreter {
@@ -117,6 +129,18 @@ pub fn render_check_text(
     if policy.forbid_rpath {
         rules.push("forbid-rpath".to_string());
     }
+    if policy.require_pie {
+        rules.push("require-pie".to_string());
+    }
+    if let Some(relro) = policy.min_relro {
+        rules.push(format!("require-relro={}", relro.as_str()));
+    }
+    if policy.require_nx {
+        rules.push("require-nx".to_string());
+    }
+    if policy.require_canary {
+        rules.push("require-canary".to_string());
+    }
     let rules_str = if rules.is_empty() {
         "(none)".to_string()
     } else {
@@ -177,6 +201,39 @@ pub fn render_check_text(
             }
             Violation::ForbiddenRpath { kind, value } => {
                 let _ = writeln!(out, "  [RPATH] forbidden {kind} entry present: {value}");
+            }
+            Violation::MissingPie { actual } => {
+                let _ = writeln!(
+                    out,
+                    "  [HARDENING] PIE required, found {} (compile with -fPIE -pie)",
+                    actual.as_str()
+                );
+            }
+            Violation::InsufficientRelro { actual, required } => {
+                let hint = match required {
+                    RelroStatus::Full => "-Wl,-z,relro,-z,now",
+                    RelroStatus::Partial => "-Wl,-z,relro",
+                    RelroStatus::None => "",
+                };
+                let _ = writeln!(
+                    out,
+                    "  [HARDENING] RELRO={} required, found {} (link with {hint})",
+                    required.as_str(),
+                    actual.as_str()
+                );
+            }
+            Violation::MissingNx { actual } => {
+                let _ = writeln!(
+                    out,
+                    "  [HARDENING] NX stack required, found {} (link with -Wl,-z,noexecstack)",
+                    actual.as_str()
+                );
+            }
+            Violation::MissingStackCanary => {
+                let _ = writeln!(
+                    out,
+                    "  [HARDENING] stack canary required, no __stack_chk_fail/__stack_chk_guard reference found (compile with -fstack-protector-strong)"
+                );
             }
         }
     }

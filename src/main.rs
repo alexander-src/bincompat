@@ -11,7 +11,7 @@ use bincompat::{
 const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "\
-bincompat - Zero-dependency ELF64 Linux binary portability CI gate
+bincompat - Zero-dependency ELF64 Linux binary portability and hardening CI gate
 
 USAGE:
   bincompat scan <path>
@@ -24,6 +24,11 @@ CHECK OPTIONS:
   --max-version <PREFIX=VER>   Fail if PREFIX version exceeds VER (repeatable)
   --forbid-abi-tag <TAG>       Fail if ABI tag appears in .gnu.version_r (repeatable)
   --forbid-rpath               Fail if DT_RPATH or DT_RUNPATH is present
+  --require-pie                Fail if binary is not position-independent (PIE/DSO)
+  --require-relro <LEVEL>      Fail if RELRO is below LEVEL (partial or full)
+  --require-nx                 Fail if PT_GNU_STACK is missing or executable
+  --require-canary             Fail if no stack canary symbol reference is found
+  --require-hardening          Enable PIE, full RELRO, NX stack, and stack canary
 
 EXIT CODES:
   0  Scan succeeded or policy check passed
@@ -144,6 +149,26 @@ fn parse_check_args(args: &[String]) -> Result<Command> {
             "--forbid-rpath" => {
                 policy.forbid_rpath = true;
             }
+            "--require-pie" => {
+                policy.require_pie = true;
+            }
+            "--require-relro" => {
+                let raw = next_value(args, &mut idx, "--require-relro")?;
+                let level = Policy::parse_relro_level(raw)?;
+                policy.min_relro = Some(match policy.min_relro {
+                    Some(existing) if existing > level => existing,
+                    _ => level,
+                });
+            }
+            "--require-nx" => {
+                policy.require_nx = true;
+            }
+            "--require-canary" => {
+                policy.require_canary = true;
+            }
+            "--require-hardening" => {
+                policy.enable_standard_hardening();
+            }
             flag if flag.starts_with('-') => {
                 return Err(BincompatError::InvalidArgument(format!(
                     "unknown option '{flag}'"
@@ -166,7 +191,7 @@ fn parse_check_args(args: &[String]) -> Result<Command> {
     })?;
     if policy.is_empty() {
         return Err(BincompatError::InvalidArgument(
-            "check requires at least one constraint (--max-glibc, --max-glibcxx, --max-version, --forbid-abi-tag, or --forbid-rpath)"
+            "check requires at least one constraint (--max-glibc, --max-glibcxx, --max-version, --forbid-abi-tag, --forbid-rpath, --require-pie, --require-relro, --require-nx, --require-canary, or --require-hardening)"
                 .to_string(),
         ));
     }

@@ -8,7 +8,7 @@ pub mod version;
 
 pub use elf::{
     analyze_bytes, analyze_file, AbiTagRequirement, AttributedSymbol, BinaryAnalysis, Endianness,
-    VersionRequirement,
+    HardeningReport, NxStatus, PieStatus, RelroStatus, VersionRequirement,
 };
 pub use error::{BincompatError, Result};
 pub use policy::{Policy, PolicyEvaluation, Violation};

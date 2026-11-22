@@ -2,7 +2,8 @@ use std::fs;
 use std::process::Command;
 
 use bincompat::{
-    analyze_bytes, analyze_file, BincompatError, Endianness, Policy, Version, VersionTag, Violation,
+    analyze_bytes, analyze_file, BincompatError, Endianness, NxStatus, PieStatus, Policy,
+    RelroStatus, Version, VersionTag, Violation,
 };
 
 struct StrTab {
@@ -485,4 +486,286 @@ fn cli_exit_codes_and_output_on_synthetic_file() {
     assert_eq!(bad_args.status.code(), Some(2));
 
     let _ = fs::remove_file(&path);
+}
+
+#[derive(Clone, Copy)]
+struct SyntheticHardeningOpts {
+    le: bool,
+    e_type: u16,
+    has_interp: bool,
+    has_gnu_relro: bool,
+    gnu_stack_flags: Option<u32>,
+    dt_bind_now: bool,
+    dt_flags: u64,
+    dt_flags_1: u64,
+    canary_in_dynsym: bool,
+    canary_in_symtab: bool,
+}
+
+fn build_synthetic_hardening_elf(opts: SyntheticHardeningOpts) -> Vec<u8> {
+    let le = opts.le;
+    let mut dynstr = StrTab::new();
+    let s_libc = dynstr.push("libc.so.6");
+    let s_canary = dynstr.push("__stack_chk_fail");
+    let s_puts = dynstr.push("puts");
+
+    let mut dynamic = Vec::new();
+    put_i64(&mut dynamic, 1, le); // DT_NEEDED
+    put_u64(&mut dynamic, u64::from(s_libc), le);
+    if opts.dt_bind_now {
+        put_i64(&mut dynamic, 24, le); // DT_BIND_NOW
+        put_u64(&mut dynamic, 0, le);
+    }
+    if opts.dt_flags != 0 {
+        put_i64(&mut dynamic, 30, le); // DT_FLAGS
+        put_u64(&mut dynamic, opts.dt_flags, le);
+    }
+    if opts.dt_flags_1 != 0 {
+        put_i64(&mut dynamic, 0x6fff_fffb, le); // DT_FLAGS_1
+        put_u64(&mut dynamic, opts.dt_flags_1, le);
+    }
+    put_i64(&mut dynamic, 0, le); // DT_NULL
+    put_u64(&mut dynamic, 0, le);
+
+    let push_sym = |buf: &mut Vec<u8>, name: u32, info: u8, shndx: u16| {
+        put_u32(buf, name, le);
+        buf.push(info);
+        buf.push(0);
+        put_u16(buf, shndx, le);
+        put_u64(buf, 0, le);
+        put_u64(buf, 0, le);
+    };
+
+    // .dynsym (without .gnu.version to ensure canary scan works independently)
+    let mut dynsym = Vec::new();
+    push_sym(&mut dynsym, 0, 0, 0);
+    push_sym(&mut dynsym, s_puts, (1 << 4) | 2, 0);
+    if opts.canary_in_dynsym {
+        push_sym(&mut dynsym, s_canary, (1 << 4) | 2, 0);
+    }
+
+    // Optional .symtab (simulates static/unstripped binary canary)
+    let mut symtab = Vec::new();
+    push_sym(&mut symtab, 0, 0, 0);
+    if opts.canary_in_symtab {
+        push_sym(&mut symtab, s_canary, (1 << 4) | 2, 1);
+    }
+
+    let interp_bytes = b"/lib64/ld-linux-x86-64.so.2\0";
+    let mut phdr_count = 0u16;
+    if opts.has_interp {
+        phdr_count += 1;
+    }
+    if opts.has_gnu_relro {
+        phdr_count += 1;
+    }
+    if opts.gnu_stack_flags.is_some() {
+        phdr_count += 1;
+    }
+
+    let mut elf = vec![0u8; 64 + usize::from(phdr_count) * 56];
+    let interp_off = elf.len() as u64;
+    if opts.has_interp {
+        elf.extend_from_slice(interp_bytes);
+        while elf.len() % 8 != 0 {
+            elf.push(0);
+        }
+    }
+
+    let dynstr_off = elf.len() as u64;
+    elf.extend_from_slice(&dynstr.bytes);
+    while elf.len() % 8 != 0 {
+        elf.push(0);
+    }
+
+    let dynamic_off = elf.len() as u64;
+    elf.extend_from_slice(&dynamic);
+
+    let dynsym_off = elf.len() as u64;
+    elf.extend_from_slice(&dynsym);
+
+    let symtab_off = elf.len() as u64;
+    if opts.canary_in_symtab {
+        elf.extend_from_slice(&symtab);
+    }
+
+    let shoff = elf.len() as u64;
+    let mut shnum = 4u16;
+    push_shdr(&mut elf, le, 0, 0, 0, 0, 0); // 0: NULL
+    push_shdr(&mut elf, le, 3, dynstr_off, dynstr.bytes.len() as u64, 0, 0); // 1: .dynstr
+    push_shdr(&mut elf, le, 6, dynamic_off, dynamic.len() as u64, 1, 16); // 2: .dynamic
+    push_shdr(&mut elf, le, 11, dynsym_off, dynsym.len() as u64, 1, 24); // 3: .dynsym
+    if opts.canary_in_symtab {
+        push_shdr(&mut elf, le, 2, symtab_off, symtab.len() as u64, 1, 24); // 4: .symtab
+        shnum += 1;
+    }
+
+    let mut ehdr = Vec::with_capacity(64);
+    ehdr.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, if le { 1 } else { 2 }, 1, 0]);
+    ehdr.extend_from_slice(&[0u8; 8]);
+    put_u16(&mut ehdr, opts.e_type, le);
+    put_u16(&mut ehdr, if le { 62 } else { 22 }, le);
+    put_u32(&mut ehdr, 1, le);
+    put_u64(&mut ehdr, 0, le);
+    put_u64(&mut ehdr, if phdr_count > 0 { 64 } else { 0 }, le);
+    put_u64(&mut ehdr, shoff, le);
+    put_u32(&mut ehdr, 0, le);
+    put_u16(&mut ehdr, 64, le);
+    put_u16(&mut ehdr, 56, le);
+    put_u16(&mut ehdr, phdr_count, le);
+    put_u16(&mut ehdr, 64, le);
+    put_u16(&mut ehdr, shnum, le);
+    put_u16(&mut ehdr, 0, le);
+    elf[0..64].copy_from_slice(&ehdr);
+
+    let mut ph_cursor = 64usize;
+    let write_phdr = |elf: &mut [u8],
+                      cursor: &mut usize,
+                      p_type: u32,
+                      p_flags: u32,
+                      p_offset: u64,
+                      p_filesz: u64| {
+        let mut ph = Vec::with_capacity(56);
+        put_u32(&mut ph, p_type, le);
+        put_u32(&mut ph, p_flags, le);
+        put_u64(&mut ph, p_offset, le);
+        put_u64(&mut ph, 0, le);
+        put_u64(&mut ph, 0, le);
+        put_u64(&mut ph, p_filesz, le);
+        put_u64(&mut ph, p_filesz, le);
+        put_u64(&mut ph, 8, le);
+        elf[*cursor..*cursor + 56].copy_from_slice(&ph);
+        *cursor += 56;
+    };
+
+    if opts.has_interp {
+        write_phdr(
+            &mut elf,
+            &mut ph_cursor,
+            3,
+            4,
+            interp_off,
+            interp_bytes.len() as u64,
+        );
+    }
+    if opts.has_gnu_relro {
+        write_phdr(&mut elf, &mut ph_cursor, 0x6474_e552, 4, 0, 0);
+    }
+    if let Some(flags) = opts.gnu_stack_flags {
+        write_phdr(&mut elf, &mut ph_cursor, 0x6474_e551, flags, 0, 0);
+    }
+
+    elf
+}
+
+#[test]
+fn detects_hardening_properties_across_endianness_and_bind_now_variants() {
+    for le in [true, false] {
+        // Full hardening via DF_1_PIE + DF_1_NOW + PT_GNU_RELRO + RW PT_GNU_STACK + dynsym canary
+        let full = build_synthetic_hardening_elf(SyntheticHardeningOpts {
+            le,
+            e_type: 3, // ET_DYN
+            has_interp: true,
+            has_gnu_relro: true,
+            gnu_stack_flags: Some(0x6), // PF_R | PF_W (non-executable)
+            dt_bind_now: false,
+            dt_flags: 0,
+            dt_flags_1: 0x0800_0001, // DF_1_PIE | DF_1_NOW
+            canary_in_dynsym: true,
+            canary_in_symtab: false,
+        });
+        let report = analyze_bytes(&full).unwrap();
+        assert_eq!(report.hardening.pie, PieStatus::Pie);
+        assert_eq!(report.hardening.relro, RelroStatus::Full);
+        assert_eq!(report.hardening.nx, NxStatus::Enabled);
+        assert!(report.hardening.stack_canary);
+
+        let mut policy = Policy::default();
+        policy.enable_standard_hardening();
+        assert!(policy.evaluate(&report).passed);
+    }
+
+    // Full RELRO via legacy DT_BIND_NOW + symtab canary + DSO (shared library)
+    let via_dt_bind_now = build_synthetic_hardening_elf(SyntheticHardeningOpts {
+        le: true,
+        e_type: 3, // ET_DYN without PT_INTERP or DF_1_PIE -> DSO
+        has_interp: false,
+        has_gnu_relro: true,
+        gnu_stack_flags: Some(0x6),
+        dt_bind_now: true,
+        dt_flags: 0,
+        dt_flags_1: 0,
+        canary_in_dynsym: false,
+        canary_in_symtab: true,
+    });
+    let dso_report = analyze_bytes(&via_dt_bind_now).unwrap();
+    assert_eq!(dso_report.hardening.pie, PieStatus::Dso);
+    assert_eq!(dso_report.hardening.relro, RelroStatus::Full);
+    assert_eq!(dso_report.hardening.nx, NxStatus::Enabled);
+    assert!(dso_report.hardening.stack_canary);
+
+    // Partial RELRO + executable stack + non-PIE + no canary
+    let weak = build_synthetic_hardening_elf(SyntheticHardeningOpts {
+        le: true,
+        e_type: 2, // ET_EXEC
+        has_interp: true,
+        has_gnu_relro: true,
+        gnu_stack_flags: Some(0x7), // PF_R | PF_W | PF_X
+        dt_bind_now: false,
+        dt_flags: 0,
+        dt_flags_1: 0,
+        canary_in_dynsym: false,
+        canary_in_symtab: false,
+    });
+    let weak_report = analyze_bytes(&weak).unwrap();
+    assert_eq!(weak_report.hardening.pie, PieStatus::NoPie);
+    assert_eq!(weak_report.hardening.relro, RelroStatus::Partial);
+    assert_eq!(weak_report.hardening.nx, NxStatus::Disabled);
+    assert!(!weak_report.hardening.stack_canary);
+
+    let mut strict = Policy::default();
+    strict.enable_standard_hardening();
+    let eval = strict.evaluate(&weak_report);
+    assert!(!eval.passed);
+    assert_eq!(eval.violations.len(), 4);
+    assert!(eval.violations.contains(&Violation::MissingPie {
+        actual: PieStatus::NoPie
+    }));
+    assert!(eval.violations.contains(&Violation::InsufficientRelro {
+        actual: RelroStatus::Partial,
+        required: RelroStatus::Full,
+    }));
+    assert!(eval.violations.contains(&Violation::MissingNx {
+        actual: NxStatus::Disabled
+    }));
+    assert!(eval.violations.contains(&Violation::MissingStackCanary));
+
+    // Partial RELRO satisfies --require-relro partial
+    let partial_only = Policy {
+        min_relro: Some(RelroStatus::Partial),
+        ..Policy::default()
+    };
+    assert!(partial_only.evaluate(&weak_report).passed);
+
+    // Full RELRO via DT_FLAGS DF_BIND_NOW (0x8) and byte-by-byte truncation safety
+    let via_df_bind_now = build_synthetic_hardening_elf(SyntheticHardeningOpts {
+        le: true,
+        e_type: 3,
+        has_interp: true,
+        has_gnu_relro: true,
+        gnu_stack_flags: Some(0x6),
+        dt_bind_now: false,
+        dt_flags: 0x8, // DF_BIND_NOW
+        dt_flags_1: 0,
+        canary_in_dynsym: true,
+        canary_in_symtab: false,
+    });
+    let df_report = analyze_bytes(&via_df_bind_now).unwrap();
+    assert_eq!(df_report.hardening.pie, PieStatus::Pie);
+    assert_eq!(df_report.hardening.relro, RelroStatus::Full);
+    assert_eq!(df_report.hardening.nx, NxStatus::Enabled);
+    assert!(df_report.hardening.stack_canary);
+    for len in 0..via_df_bind_now.len() {
+        assert!(analyze_bytes(&via_df_bind_now[..len]).is_err());
+    }
 }

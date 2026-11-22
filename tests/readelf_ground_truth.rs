@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use bincompat::{analyze_file, Policy, Version};
+use bincompat::{analyze_file, NxStatus, PieStatus, Policy, RelroStatus, Version};
 
 fn command_available(cmd: &str) -> bool {
     Command::new(cmd)
@@ -150,6 +150,21 @@ fn matches_gnu_readelf_on_live_linux_system_binaries() {
             readelf_undef_versioned_symbols(path),
             "attributed undefined symbols mismatch on {candidate}"
         );
+
+        let (has_relro, expected_nx, bind_now) = readelf_hardening(path);
+        let expected_relro = match (has_relro, bind_now) {
+            (true, true) => RelroStatus::Full,
+            (true, false) => RelroStatus::Partial,
+            (false, _) => RelroStatus::None,
+        };
+        assert_eq!(
+            analysis.hardening.relro, expected_relro,
+            "RELRO mismatch vs readelf on {candidate}"
+        );
+        assert_eq!(
+            analysis.hardening.nx, expected_nx,
+            "NX mismatch vs readelf on {candidate}"
+        );
     }
 
     assert!(checked > 0, "expected at least one Linux system binary");
@@ -212,6 +227,238 @@ int main() {
     let eval = policy.evaluate(&analysis);
     assert!(!eval.passed);
     assert!(eval.violations.len() >= 2);
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+fn readelf_hardening(path: &Path) -> (bool, NxStatus, bool) {
+    let ph_out = Command::new("readelf")
+        .args(["-l", "-W"])
+        .arg(path)
+        .output()
+        .expect("readelf -l failed");
+    assert!(ph_out.status.success());
+    let ph_text = String::from_utf8_lossy(&ph_out.stdout);
+
+    let mut has_relro = false;
+    let mut nx = NxStatus::Missing;
+    for line in ph_text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.is_empty() {
+            continue;
+        }
+        if cols[0] == "GNU_RELRO" {
+            has_relro = true;
+        } else if cols[0] == "GNU_STACK" {
+            // Format: Type Offset VirtAddr PhysAddr FileSiz MemSiz Flg Align
+            let flg = cols.get(6).copied().unwrap_or("");
+            nx = if flg.contains('E') {
+                NxStatus::Disabled
+            } else {
+                NxStatus::Enabled
+            };
+        }
+    }
+
+    let dyn_out = Command::new("readelf")
+        .args(["-d", "-W"])
+        .arg(path)
+        .output()
+        .expect("readelf -d failed");
+    assert!(dyn_out.status.success());
+    let dyn_text = String::from_utf8_lossy(&dyn_out.stdout);
+    let mut bind_now = false;
+    for line in dyn_text.lines() {
+        if line.contains("(BIND_NOW)")
+            || (line.contains("(FLAGS)") && line.contains("BIND_NOW"))
+            || (line.contains("(FLAGS_1)") && line.split_whitespace().any(|t| t == "NOW"))
+        {
+            bind_now = true;
+        }
+    }
+
+    (has_relro, nx, bind_now)
+}
+
+#[test]
+fn matches_readelf_hardening_on_live_gxx_hardened_partial_and_unhardened_builds() {
+    if !cfg!(target_os = "linux") || !command_available("g++") || !command_available("readelf") {
+        return;
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("bincompat_harden_{}", std::process::id()));
+    fs::create_dir_all(&tmp_dir).unwrap();
+    let src_path = tmp_dir.join("canary_sample.cpp");
+    let hardened_bin = tmp_dir.join("hardened_app");
+    let partial_bin = tmp_dir.join("partial_relro_app");
+    let unhardened_bin = tmp_dir.join("unhardened_app");
+
+    // Stack buffer copy guarantees -fstack-protector-strong emits __stack_chk_fail
+    fs::write(
+        &src_path,
+        r#"
+#include <cstring>
+#include <iostream>
+
+__attribute__((noinline))
+size_t copy_and_measure(const char* input) {
+    char buf[64];
+    std::strncpy(buf, input, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    return std::strlen(buf);
+}
+
+int main(int argc, char** argv) {
+    const char* msg = argc > 1 ? argv[1] : "bincompat";
+    std::cout << copy_and_measure(msg) << "\n";
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    let compile = |out: &Path, flags: &[&str]| {
+        let output = Command::new("g++")
+            .args(flags)
+            .arg("-o")
+            .arg(out)
+            .arg(&src_path)
+            .output()
+            .expect("failed to invoke g++");
+        assert!(
+            output.status.success(),
+            "g++ failed for {}:\n{}",
+            out.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    compile(
+        &hardened_bin,
+        &[
+            "-O2",
+            "-fPIE",
+            "-pie",
+            "-Wl,-z,relro,-z,now",
+            "-Wl,-z,noexecstack",
+            "-fstack-protector-strong",
+        ],
+    );
+    compile(
+        &partial_bin,
+        &[
+            "-O2",
+            "-fPIE",
+            "-pie",
+            "-Wl,-z,relro,-z,lazy",
+            "-Wl,-z,noexecstack",
+            "-fstack-protector-strong",
+        ],
+    );
+    compile(
+        &unhardened_bin,
+        &[
+            "-O2",
+            "-fno-pie",
+            "-no-pie",
+            "-Wl,-z,norelro",
+            "-Wl,-z,execstack",
+            "-fno-stack-protector",
+        ],
+    );
+
+    // Cross-check all three against GNU readelf -l / -d
+    for path in [&hardened_bin, &partial_bin, &unhardened_bin] {
+        let analysis = analyze_file(path).unwrap();
+        let (has_relro, expected_nx, bind_now) = readelf_hardening(path);
+        let expected_relro = match (has_relro, bind_now) {
+            (true, true) => RelroStatus::Full,
+            (true, false) => RelroStatus::Partial,
+            (false, _) => RelroStatus::None,
+        };
+        assert_eq!(
+            analysis.hardening.relro,
+            expected_relro,
+            "RELRO mismatch vs readelf on {}",
+            path.display()
+        );
+        assert_eq!(
+            analysis.hardening.nx,
+            expected_nx,
+            "NX mismatch vs readelf on {}",
+            path.display()
+        );
+    }
+
+    let h = analyze_file(&hardened_bin).unwrap();
+    assert_eq!(h.hardening.pie, PieStatus::Pie);
+    assert_eq!(h.hardening.relro, RelroStatus::Full);
+    assert_eq!(h.hardening.nx, NxStatus::Enabled);
+    assert!(h.hardening.stack_canary);
+
+    let p = analyze_file(&partial_bin).unwrap();
+    assert_eq!(p.hardening.pie, PieStatus::Pie);
+    assert_eq!(p.hardening.relro, RelroStatus::Partial);
+    assert_eq!(p.hardening.nx, NxStatus::Enabled);
+    assert!(p.hardening.stack_canary);
+
+    let u = analyze_file(&unhardened_bin).unwrap();
+    assert_eq!(u.hardening.pie, PieStatus::NoPie);
+    assert_eq!(u.hardening.relro, RelroStatus::None);
+    assert_eq!(u.hardening.nx, NxStatus::Disabled);
+    assert!(!u.hardening.stack_canary);
+
+    // Exercise the actual CLI binary on hardened, partial, and unhardened builds
+    let cli = env!("CARGO_BIN_EXE_bincompat");
+
+    let pass = Command::new(cli)
+        .args(["check"])
+        .arg(&hardened_bin)
+        .arg("--require-hardening")
+        .output()
+        .unwrap();
+    assert_eq!(pass.status.code(), Some(0));
+    let pass_out = String::from_utf8_lossy(&pass.stdout);
+    assert!(pass_out.contains("hardening     : PIE=pie, RELRO=full, NX=enabled, canary=present"));
+    assert!(pass_out.contains("Policy Status: PASS"));
+
+    let partial_pass = Command::new(cli)
+        .args(["check"])
+        .arg(&partial_bin)
+        .args([
+            "--require-pie",
+            "--require-relro",
+            "partial",
+            "--require-nx",
+            "--require-canary",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(partial_pass.status.code(), Some(0));
+
+    let partial_fail = Command::new(cli)
+        .args(["check"])
+        .arg(&partial_bin)
+        .args(["--require-relro", "full"])
+        .output()
+        .unwrap();
+    assert_eq!(partial_fail.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&partial_fail.stdout)
+        .contains("RELRO=full required, found partial"));
+
+    let unhardened_fail = Command::new(cli)
+        .args(["check"])
+        .arg(&unhardened_bin)
+        .arg("--require-hardening")
+        .output()
+        .unwrap();
+    assert_eq!(unhardened_fail.status.code(), Some(1));
+    let fail_out = String::from_utf8_lossy(&unhardened_fail.stdout);
+    assert!(fail_out.contains("Policy Status: FAIL"));
+    assert!(fail_out.contains("PIE required, found no-pie"));
+    assert!(fail_out.contains("RELRO=full required, found none"));
+    assert!(fail_out.contains("NX stack required, found disabled"));
+    assert!(fail_out.contains("stack canary required"));
 
     let _ = fs::remove_dir_all(&tmp_dir);
 }

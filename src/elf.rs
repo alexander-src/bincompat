@@ -23,7 +23,12 @@ const ET_DYN: u16 = 3;
 const ET_CORE: u16 = 4;
 
 const PT_INTERP: u32 = 3;
+const PT_GNU_STACK: u32 = 0x6474_e551;
+const PT_GNU_RELRO: u32 = 0x6474_e552;
 
+const PF_X: u32 = 0x1;
+
+const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_DYNAMIC: u32 = 6;
 const SHT_NOBITS: u32 = 8;
@@ -40,9 +45,14 @@ const DT_NULL: i64 = 0;
 const DT_NEEDED: i64 = 1;
 const DT_SONAME: i64 = 14;
 const DT_RPATH: i64 = 15;
+const DT_BIND_NOW: i64 = 24;
 const DT_RUNPATH: i64 = 29;
 const DT_FLAGS: i64 = 30;
 const DT_FLAGS_1: i64 = 0x6fff_fffb;
+
+const DF_BIND_NOW: u64 = 0x8;
+const DF_1_NOW: u64 = 0x1;
+const DF_1_PIE: u64 = 0x0800_0000;
 
 const VERSYM_HIDDEN_MASK: u16 = 0x8000;
 const VERSYM_VERSION_MASK: u16 = 0x7fff;
@@ -118,7 +128,82 @@ pub struct AbiTagRequirement {
     pub symbol_count: usize,
 }
 
-/// Complete Milestone 1 portability analysis for an ELF64 binary.
+/// Position-independent execution status derived from `e_type`, `PT_INTERP`,
+/// `DT_SONAME`, and `DF_1_PIE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PieStatus {
+    Pie,
+    Dso,
+    NoPie,
+    NotApplicable,
+}
+
+impl PieStatus {
+    pub fn is_position_independent(self) -> bool {
+        matches!(self, Self::Pie | Self::Dso)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pie => "pie",
+            Self::Dso => "dso",
+            Self::NoPie => "no-pie",
+            Self::NotApplicable => "n/a",
+        }
+    }
+}
+
+/// Relocation read-only (RELRO) protection level derived from `PT_GNU_RELRO`
+/// and eager-binding dynamic tags (`DT_BIND_NOW`, `DF_BIND_NOW`, `DF_1_NOW`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RelroStatus {
+    None,
+    Partial,
+    Full,
+}
+
+impl RelroStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Partial => "partial",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Non-executable stack (NX) status derived from `PT_GNU_STACK` (`p_flags & PF_X`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NxStatus {
+    Enabled,
+    Disabled,
+    Missing,
+}
+
+impl NxStatus {
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// Binary security hardening summary extracted from ELF64 headers and symbols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardeningReport {
+    pub pie: PieStatus,
+    pub relro: RelroStatus,
+    pub nx: NxStatus,
+    pub stack_canary: bool,
+}
+
+/// Complete portability and hardening analysis for an ELF64 binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryAnalysis {
     pub elf_type: String,
@@ -132,10 +217,29 @@ pub struct BinaryAnalysis {
     pub runpath: Option<String>,
     pub dt_flags: u64,
     pub dt_flags_1: u64,
+    pub hardening: HardeningReport,
     pub dynsym_count: usize,
     pub requirements: Vec<VersionRequirement>,
     pub max_versions: BTreeMap<String, Version>,
     pub abi_tags: Vec<AbiTagRequirement>,
+}
+
+#[derive(Debug, Default)]
+struct ProgramHeaderInfo {
+    interpreter: Option<String>,
+    has_gnu_relro: bool,
+    gnu_stack_flags: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+struct DynamicInfo {
+    soname: Option<String>,
+    needed: Vec<String>,
+    rpath: Option<String>,
+    runpath: Option<String>,
+    dt_flags: u64,
+    dt_flags_1: u64,
+    has_dt_bind_now: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -189,32 +293,17 @@ pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis> {
     let e_shentsize = read_u16_or(endian, bytes, 58, "e_shentsize")?;
     let e_shnum_raw = read_u16_or(endian, bytes, 60, "e_shnum")?;
 
-    let interpreter = parse_interp(bytes, endian, e_phoff, e_phentsize, e_phnum)?;
+    let phdrs = parse_program_headers(bytes, endian, e_phoff, e_phentsize, e_phnum)?;
     let sections = parse_section_headers(bytes, endian, e_shoff, e_shentsize, e_shnum_raw)?;
 
     let mut is_dynamic = false;
-    let mut soname = None;
-    let mut needed = Vec::new();
-    let mut rpath = None;
-    let mut runpath = None;
-    let mut dt_flags = 0u64;
-    let mut dt_flags_1 = 0u64;
+    let mut dynamic_info = DynamicInfo::default();
 
     if let Some(dyn_shdr) = sections.iter().find(|s| s.sh_type == SHT_DYNAMIC) {
         is_dynamic = true;
         let dyn_bytes = section_slice(bytes, dyn_shdr, "SHT_DYNAMIC")?;
         let strtab = linked_strtab(bytes, &sections, dyn_shdr.sh_link, "SHT_DYNAMIC")?;
-        parse_dynamic_section(
-            dyn_bytes,
-            strtab,
-            endian,
-            &mut needed,
-            &mut soname,
-            &mut rpath,
-            &mut runpath,
-            &mut dt_flags,
-            &mut dt_flags_1,
-        )?;
+        dynamic_info = parse_dynamic_section(dyn_bytes, strtab, endian)?;
     }
 
     let mut requirements = Vec::new();
@@ -233,20 +322,10 @@ pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis> {
     }
 
     let mut dynsym_count = 0usize;
+    let mut stack_canary = false;
     if let Some(dynsym_shdr) = sections.iter().find(|s| s.sh_type == SHT_DYNSYM) {
         let dynsym_bytes = section_slice(bytes, dynsym_shdr, "SHT_DYNSYM")?;
-        let entsize = usize::try_from(dynsym_shdr.sh_entsize).map_err(|_| {
-            BincompatError::CorruptSection("SHT_DYNSYM sh_entsize overflows usize".to_string())
-        })?;
-        let stride = if entsize == 0 {
-            ELF64_SYM_SIZE
-        } else if entsize < ELF64_SYM_SIZE {
-            return Err(BincompatError::CorruptSection(format!(
-                "SHT_DYNSYM sh_entsize {entsize} is smaller than {ELF64_SYM_SIZE}"
-            )));
-        } else {
-            entsize
-        };
+        let stride = checked_sym_stride(dynsym_shdr.sh_entsize, "SHT_DYNSYM")?;
         if dynsym_bytes.len() % stride != 0 {
             return Err(BincompatError::CorruptSection(format!(
                 "SHT_DYNSYM size {} is not a multiple of entry size {}",
@@ -255,10 +334,14 @@ pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis> {
             )));
         }
         dynsym_count = dynsym_bytes.len() / stride;
+        let strtab = linked_strtab(bytes, &sections, dynsym_shdr.sh_link, "SHT_DYNSYM")?;
+
+        if has_canary_symbol(dynsym_bytes, stride, dynsym_count, strtab, endian, true)? {
+            stack_canary = true;
+        }
 
         if let Some(versym_shdr) = sections.iter().find(|s| s.sh_type == SHT_GNU_VERSYM) {
             let versym_bytes = section_slice(bytes, versym_shdr, "SHT_GNU_VERSYM")?;
-            let strtab = linked_strtab(bytes, &sections, dynsym_shdr.sh_link, "SHT_DYNSYM")?;
             attribute_dynsym_versions(
                 dynsym_bytes,
                 stride,
@@ -271,6 +354,42 @@ pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis> {
             )?;
         }
     }
+
+    if !stack_canary {
+        if let Some(symtab_shdr) = sections.iter().find(|s| s.sh_type == SHT_SYMTAB) {
+            let symtab_bytes = section_slice(bytes, symtab_shdr, "SHT_SYMTAB")?;
+            let stride = checked_sym_stride(symtab_shdr.sh_entsize, "SHT_SYMTAB")?;
+            if symtab_bytes.len() % stride != 0 {
+                return Err(BincompatError::CorruptSection(format!(
+                    "SHT_SYMTAB size {} is not a multiple of entry size {}",
+                    symtab_bytes.len(),
+                    stride
+                )));
+            }
+            let sym_count = symtab_bytes.len() / stride;
+            let strtab = linked_strtab(bytes, &sections, symtab_shdr.sh_link, "SHT_SYMTAB")?;
+            if has_canary_symbol(symtab_bytes, stride, sym_count, strtab, endian, false)? {
+                stack_canary = true;
+            }
+        }
+    }
+
+    let hardening = HardeningReport {
+        pie: compute_pie_status(
+            e_type,
+            phdrs.interpreter.as_deref(),
+            dynamic_info.soname.as_deref(),
+            dynamic_info.dt_flags_1,
+        ),
+        relro: compute_relro_status(
+            phdrs.has_gnu_relro,
+            dynamic_info.has_dt_bind_now,
+            dynamic_info.dt_flags,
+            dynamic_info.dt_flags_1,
+        ),
+        nx: compute_nx_status(phdrs.gnu_stack_flags),
+        stack_canary,
+    };
 
     for req in &mut requirements {
         req.symbols.sort();
@@ -333,18 +452,116 @@ pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis> {
         machine: format_machine(e_machine),
         endianness: endian,
         is_dynamic,
-        interpreter,
-        soname,
-        needed,
-        rpath,
-        runpath,
-        dt_flags,
-        dt_flags_1,
+        interpreter: phdrs.interpreter,
+        soname: dynamic_info.soname,
+        needed: dynamic_info.needed,
+        rpath: dynamic_info.rpath,
+        runpath: dynamic_info.runpath,
+        dt_flags: dynamic_info.dt_flags,
+        dt_flags_1: dynamic_info.dt_flags_1,
+        hardening,
         dynsym_count,
         requirements,
         max_versions,
         abi_tags,
     })
+}
+
+fn checked_sym_stride(sh_entsize: u64, label: &str) -> Result<usize> {
+    let entsize = usize::try_from(sh_entsize).map_err(|_| {
+        BincompatError::CorruptSection(format!("{label} sh_entsize overflows usize"))
+    })?;
+    if entsize == 0 {
+        Ok(ELF64_SYM_SIZE)
+    } else if entsize < ELF64_SYM_SIZE {
+        Err(BincompatError::CorruptSection(format!(
+            "{label} sh_entsize {entsize} is smaller than {ELF64_SYM_SIZE}"
+        )))
+    } else {
+        Ok(entsize)
+    }
+}
+
+fn is_stack_canary_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "__stack_chk_fail"
+            | "__stack_chk_fail_local"
+            | "__stack_chk_guard"
+            | "__intel_security_cookie"
+    )
+}
+
+fn has_canary_symbol(
+    sym_bytes: &[u8],
+    stride: usize,
+    sym_count: usize,
+    strtab: &[u8],
+    endian: Endianness,
+    undef_only: bool,
+) -> Result<bool> {
+    for i in 1..sym_count {
+        let sym_off = i * stride;
+        let st_name = endian.read_u32(sym_bytes, sym_off).ok_or_else(|| {
+            BincompatError::CorruptSection("truncated Elf64_Sym.st_name".to_string())
+        })?;
+        let st_shndx = endian.read_u16(sym_bytes, sym_off + 6).ok_or_else(|| {
+            BincompatError::CorruptSection("truncated Elf64_Sym.st_shndx".to_string())
+        })?;
+        if undef_only && st_shndx != SHN_UNDEF {
+            continue;
+        }
+        if st_name == 0 {
+            continue;
+        }
+        let name = read_cstr(strtab, u64::from(st_name), "Elf64_Sym.st_name")?;
+        if is_stack_canary_symbol(&name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn compute_pie_status(
+    e_type: u16,
+    interpreter: Option<&str>,
+    soname: Option<&str>,
+    dt_flags_1: u64,
+) -> PieStatus {
+    match e_type {
+        ET_DYN => {
+            if (dt_flags_1 & DF_1_PIE) != 0 || (interpreter.is_some() && soname.is_none()) {
+                PieStatus::Pie
+            } else {
+                PieStatus::Dso
+            }
+        }
+        ET_EXEC => PieStatus::NoPie,
+        _ => PieStatus::NotApplicable,
+    }
+}
+
+fn compute_relro_status(
+    has_gnu_relro: bool,
+    has_dt_bind_now: bool,
+    dt_flags: u64,
+    dt_flags_1: u64,
+) -> RelroStatus {
+    if !has_gnu_relro {
+        RelroStatus::None
+    } else if has_dt_bind_now || (dt_flags & DF_BIND_NOW) != 0 || (dt_flags_1 & DF_1_NOW) != 0 {
+        RelroStatus::Full
+    } else {
+        RelroStatus::Partial
+    }
+}
+
+fn compute_nx_status(gnu_stack_flags: Option<u32>) -> NxStatus {
+    match gnu_stack_flags {
+        Some(flags) if (flags & PF_X) == 0 => NxStatus::Enabled,
+        Some(_) => NxStatus::Disabled,
+        None => NxStatus::Missing,
+    }
 }
 
 fn read_u16_or(endian: Endianness, bytes: &[u8], off: usize, field: &str) -> Result<u16> {
@@ -359,15 +576,16 @@ fn read_u64_or(endian: Endianness, bytes: &[u8], off: usize, field: &str) -> Res
         .ok_or_else(|| BincompatError::InvalidElf(format!("truncated header field {field}")))
 }
 
-fn parse_interp(
+fn parse_program_headers(
     bytes: &[u8],
     endian: Endianness,
     e_phoff: u64,
     e_phentsize: u16,
     e_phnum: u16,
-) -> Result<Option<String>> {
+) -> Result<ProgramHeaderInfo> {
+    let mut info = ProgramHeaderInfo::default();
     if e_phnum == 0 || e_phoff == 0 {
-        return Ok(None);
+        return Ok(info);
     }
     let entsize = usize::from(e_phentsize);
     if entsize < ELF64_PHDR_MIN_SIZE {
@@ -394,32 +612,46 @@ fn parse_interp(
         let p_type = endian
             .read_u32(bytes, base)
             .ok_or_else(|| BincompatError::InvalidElf("truncated program header".to_string()))?;
-        if p_type == PT_INTERP {
-            let p_offset = endian.read_u64(bytes, base + 8).ok_or_else(|| {
-                BincompatError::InvalidElf("truncated PT_INTERP p_offset".to_string())
-            })?;
-            let p_filesz = endian.read_u64(bytes, base + 32).ok_or_else(|| {
-                BincompatError::InvalidElf("truncated PT_INTERP p_filesz".to_string())
-            })?;
-            let start = usize::try_from(p_offset).map_err(|_| {
-                BincompatError::InvalidElf("PT_INTERP offset overflows usize".to_string())
-            })?;
-            let len = usize::try_from(p_filesz).map_err(|_| {
-                BincompatError::InvalidElf("PT_INTERP size overflows usize".to_string())
-            })?;
-            let end = start.checked_add(len).ok_or_else(|| {
-                BincompatError::InvalidElf("PT_INTERP range overflows".to_string())
-            })?;
-            let slice = bytes.get(start..end).ok_or_else(|| {
-                BincompatError::InvalidElf("PT_INTERP exceeds file bounds".to_string())
-            })?;
-            let nul_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-            return Ok(Some(
-                String::from_utf8_lossy(&slice[..nul_pos]).into_owned(),
-            ));
+        let p_flags = endian.read_u32(bytes, base + 4).ok_or_else(|| {
+            BincompatError::InvalidElf("truncated program header p_flags".to_string())
+        })?;
+
+        match p_type {
+            PT_INTERP => {
+                let p_offset = endian.read_u64(bytes, base + 8).ok_or_else(|| {
+                    BincompatError::InvalidElf("truncated PT_INTERP p_offset".to_string())
+                })?;
+                let p_filesz = endian.read_u64(bytes, base + 32).ok_or_else(|| {
+                    BincompatError::InvalidElf("truncated PT_INTERP p_filesz".to_string())
+                })?;
+                let start = usize::try_from(p_offset).map_err(|_| {
+                    BincompatError::InvalidElf("PT_INTERP offset overflows usize".to_string())
+                })?;
+                let len = usize::try_from(p_filesz).map_err(|_| {
+                    BincompatError::InvalidElf("PT_INTERP size overflows usize".to_string())
+                })?;
+                let end = start.checked_add(len).ok_or_else(|| {
+                    BincompatError::InvalidElf("PT_INTERP range overflows".to_string())
+                })?;
+                let slice = bytes.get(start..end).ok_or_else(|| {
+                    BincompatError::InvalidElf("PT_INTERP exceeds file bounds".to_string())
+                })?;
+                let nul_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+                if info.interpreter.is_none() {
+                    info.interpreter =
+                        Some(String::from_utf8_lossy(&slice[..nul_pos]).into_owned());
+                }
+            }
+            PT_GNU_RELRO => {
+                info.has_gnu_relro = true;
+            }
+            PT_GNU_STACK => {
+                info.gnu_stack_flags = Some(p_flags);
+            }
+            _ => {}
         }
     }
-    Ok(None)
+    Ok(info)
 }
 
 fn parse_section_headers(
@@ -565,24 +797,18 @@ fn read_cstr(strtab: &[u8], offset: u64, context: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&tail[..nul_pos]).into_owned())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn parse_dynamic_section(
     dyn_bytes: &[u8],
     strtab: &[u8],
     endian: Endianness,
-    needed: &mut Vec<String>,
-    soname: &mut Option<String>,
-    rpath: &mut Option<String>,
-    runpath: &mut Option<String>,
-    dt_flags: &mut u64,
-    dt_flags_1: &mut u64,
-) -> Result<()> {
+) -> Result<DynamicInfo> {
     if dyn_bytes.len() % ELF64_DYN_SIZE != 0 {
         return Err(BincompatError::CorruptDynamic(format!(
             "SHT_DYNAMIC size {} is not a multiple of {ELF64_DYN_SIZE}",
             dyn_bytes.len()
         )));
     }
+    let mut info = DynamicInfo::default();
     let mut off = 0usize;
     while off < dyn_bytes.len() {
         let d_tag = endian
@@ -597,19 +823,20 @@ fn parse_dynamic_section(
             DT_NULL => break,
             DT_NEEDED => {
                 let lib = read_cstr(strtab, d_val, "DT_NEEDED")?;
-                if !needed.contains(&lib) {
-                    needed.push(lib);
+                if !info.needed.contains(&lib) {
+                    info.needed.push(lib);
                 }
             }
-            DT_SONAME => *soname = Some(read_cstr(strtab, d_val, "DT_SONAME")?),
-            DT_RPATH => *rpath = Some(read_cstr(strtab, d_val, "DT_RPATH")?),
-            DT_RUNPATH => *runpath = Some(read_cstr(strtab, d_val, "DT_RUNPATH")?),
-            DT_FLAGS => *dt_flags |= d_val,
-            DT_FLAGS_1 => *dt_flags_1 |= d_val,
+            DT_SONAME => info.soname = Some(read_cstr(strtab, d_val, "DT_SONAME")?),
+            DT_RPATH => info.rpath = Some(read_cstr(strtab, d_val, "DT_RPATH")?),
+            DT_BIND_NOW => info.has_dt_bind_now = true,
+            DT_RUNPATH => info.runpath = Some(read_cstr(strtab, d_val, "DT_RUNPATH")?),
+            DT_FLAGS => info.dt_flags |= d_val,
+            DT_FLAGS_1 => info.dt_flags_1 |= d_val,
             _ => {}
         }
     }
-    Ok(())
+    Ok(info)
 }
 
 fn parse_verneed_section(
