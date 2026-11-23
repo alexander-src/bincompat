@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::distro::{lookup_distro, supported_target_ids};
 use crate::elf::{AttributedSymbol, BinaryAnalysis, NxStatus, PieStatus, RelroStatus};
 use crate::error::{BincompatError, Result};
 use crate::version::{Version, VersionTag};
@@ -29,6 +30,33 @@ impl Policy {
 
     pub fn set_max_version(&mut self, family: impl Into<String>, version: Version) {
         self.max_versions.insert(family.into(), version);
+    }
+
+    /// Applies a built-in Linux distribution compatibility baseline (`--target`).
+    pub fn apply_distro_target(&mut self, target: &str) -> Result<&'static str> {
+        let baseline = lookup_distro(target).ok_or_else(|| {
+            BincompatError::InvalidArgument(format!(
+                "unknown --target '{target}' (supported: {})",
+                supported_target_ids().join(", ")
+            ))
+        })?;
+        let glibc = Version::parse(baseline.glibc).expect("valid static glibc version");
+        let glibcxx = Version::parse(baseline.glibcxx).expect("valid static glibcxx version");
+        self.set_min_max_version("GLIBC", glibc);
+        self.set_min_max_version("GLIBCXX", glibcxx);
+        if !baseline.supports_dt_relr {
+            self.forbid_abi_tags.insert("GLIBC_ABI_DT_RELR".to_string());
+        }
+        Ok(baseline.id)
+    }
+
+    fn set_min_max_version(&mut self, family: &str, version: Version) {
+        match self.max_versions.get(family) {
+            Some(existing) if existing <= &version => {}
+            _ => {
+                self.max_versions.insert(family.to_string(), version);
+            }
+        }
     }
 
     /// Enables standard Linux binary hardening checks: PIE, full RELRO, NX stack,
