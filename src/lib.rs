@@ -20,6 +20,7 @@ pub use elf::{
 pub use error::{BincompatError, Result};
 pub use policy::{Policy, PolicyEvaluation, Violation};
 pub use report::{
-    render_check, render_check_text, render_diff, render_scan, render_scan_text, OutputFormat,
+    render_check, render_check_text, render_diff, render_scan, render_scan_text, render_targets,
+    OutputFormat,
 };
 pub use version::{Version, VersionTag};

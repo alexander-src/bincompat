@@ -664,6 +664,145 @@ fn cli_supports_target_diff_and_all_formats() {
     let _ = fs::remove_file(&cand_path);
 }
 
+#[test]
+fn cli_supports_out_flag_and_targets_subcommand() {
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("bincompat_out_targets_{pid}"));
+    let _ = fs::create_dir_all(&dir);
+    let base_path = dir.join("base.elf");
+    let cand_path = dir.join("cand.elf");
+    let scan_out = dir.join("scan.json");
+    let sarif_out = dir.join("check.sarif");
+    let diff_out = dir.join("diff.md");
+    let targets_out = dir.join("targets.json");
+
+    fs::write(
+        &base_path,
+        build_elf(&SyntheticSpec {
+            e_type: 3,
+            needed: vec!["libc.so.6"],
+            runpath: None,
+            glibc_tag: "GLIBC_2.17",
+            glibc_sym: "clock_gettime",
+            dt_relr: false,
+            full_relro: true,
+            nx_enabled: true,
+            canary: true,
+        }),
+    )
+    .unwrap();
+    fs::write(
+        &cand_path,
+        build_elf(&SyntheticSpec {
+            e_type: 3,
+            needed: vec!["libc.so.6"],
+            runpath: None,
+            glibc_tag: "GLIBC_2.39",
+            glibc_sym: "pidfd_getpid",
+            dt_relr: true,
+            full_relro: true,
+            nx_enabled: true,
+            canary: true,
+        }),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_bincompat");
+
+    // targets subcommand in text, json (--out), markdown, and rejecting sarif
+    let t_text = Command::new(bin).args(["targets"]).output().unwrap();
+    assert_eq!(t_text.status.code(), Some(0));
+    let t_text_str = String::from_utf8(t_text.stdout).unwrap();
+    assert!(t_text_str.contains("centos-7"));
+    assert!(t_text_str.contains("rhel-10"));
+
+    let t_json = Command::new(bin)
+        .args(["targets", "--format", "json", "--out"])
+        .arg(&targets_out)
+        .output()
+        .unwrap();
+    assert_eq!(t_json.status.code(), Some(0));
+    assert!(t_json.stdout.is_empty());
+    let t_json_str = fs::read_to_string(&targets_out).unwrap();
+    assert_valid_json(&t_json_str);
+    assert!(t_json_str.contains("\"id\": \"centos-7\""));
+    assert!(t_json_str.contains("\"id\": \"rhel-10\""));
+
+    let t_md = Command::new(bin)
+        .args(["targets", "--format", "markdown"])
+        .output()
+        .unwrap();
+    assert_eq!(t_md.status.code(), Some(0));
+    let t_md_str = String::from_utf8(t_md.stdout).unwrap();
+    assert!(t_md_str.contains("| `centos-7` |"));
+    assert!(t_md_str.contains("| `rhel-10` |"));
+
+    let t_sarif = Command::new(bin)
+        .args(["targets", "--format", "sarif"])
+        .output()
+        .unwrap();
+    assert_eq!(t_sarif.status.code(), Some(2));
+
+    // scan -o writes JSON cleanly with empty stdout
+    let scan = Command::new(bin)
+        .args(["scan"])
+        .arg(&base_path)
+        .args(["--format", "json", "-o"])
+        .arg(&scan_out)
+        .output()
+        .unwrap();
+    assert_eq!(scan.status.code(), Some(0));
+    assert!(scan.stdout.is_empty());
+    assert_valid_json(&fs::read_to_string(&scan_out).unwrap());
+
+    // check with centos-7 passes base and fails cand, writing SARIF to file
+    let check_c7_pass = Command::new(bin)
+        .args(["check"])
+        .arg(&base_path)
+        .args(["--target", "manylinux2014"])
+        .output()
+        .unwrap();
+    assert_eq!(check_c7_pass.status.code(), Some(0));
+
+    let check_c7_fail = Command::new(bin)
+        .args(["check"])
+        .arg(&cand_path)
+        .args(["--target", "centos-7", "--format", "sarif", "-o"])
+        .arg(&sarif_out)
+        .output()
+        .unwrap();
+    assert_eq!(check_c7_fail.status.code(), Some(1));
+    assert!(check_c7_fail.stdout.is_empty());
+    let sarif_str = fs::read_to_string(&sarif_out).unwrap();
+    assert_valid_json(&sarif_str);
+    assert!(sarif_str.contains("BC001"));
+
+    // check with rhel-10 passes cand (glibc 2.39 + DT_RELR)
+    let check_r10 = Command::new(bin)
+        .args(["check"])
+        .arg(&cand_path)
+        .args(["--target", "rhel-10"])
+        .output()
+        .unwrap();
+    assert_eq!(check_r10.status.code(), Some(0));
+
+    // diff --out writes Markdown cleanly and preserves exit code 1
+    let diff = Command::new(bin)
+        .args(["diff"])
+        .arg(&base_path)
+        .arg(&cand_path)
+        .args(["--format", "markdown", "--out"])
+        .arg(&diff_out)
+        .output()
+        .unwrap();
+    assert_eq!(diff.status.code(), Some(1));
+    assert!(diff.stdout.is_empty());
+    let diff_str = fs::read_to_string(&diff_out).unwrap();
+    assert!(diff_str.contains("pidfd_getpid"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn live_gcc_hardening_regression_detected_by_diff_and_sarif() {

@@ -1,6 +1,6 @@
 [package]
 name = "bincompat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Zero-dependency safe Rust ELF64 Linux binary portability and hardening CI gate"

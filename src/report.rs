@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use crate::diff::{BinaryDiff, DiffRegression};
-use crate::distro::{evaluate_distro_matrix, DistroCompatibility};
+use crate::distro::{evaluate_distro_matrix, DistroCompatibility, DISTRO_BASELINES};
 use crate::elf::{AttributedSymbol, BinaryAnalysis, Endianness, RelroStatus};
 use crate::error::{BincompatError, Result};
 use crate::policy::{Policy, PolicyEvaluation, Violation};
@@ -73,6 +73,75 @@ pub fn render_diff(
         OutputFormat::Json => render_diff_json(baseline_label, candidate_label, diff),
         OutputFormat::Markdown => render_diff_markdown(baseline_label, candidate_label, diff),
         OutputFormat::Sarif => render_diff_sarif(baseline_label, candidate_label, diff),
+    }
+}
+
+/// Renders `bincompat targets` output in the requested format (`text`, `json`, or `markdown`).
+pub fn render_targets(format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Text => {
+            let mut out = String::new();
+            let _ = writeln!(out, "bincompat targets (built-in Linux distro baselines)");
+            let _ = writeln!(
+                out,
+                "  {:<14} {:<32} {:<8} {:<9} DT_RELR",
+                "TARGET", "DISTRO", "GLIBC", "GLIBCXX"
+            );
+            for d in DISTRO_BASELINES {
+                let _ = writeln!(
+                    out,
+                    "  {:<14} {:<32} {:<8} {:<9} {}",
+                    d.id,
+                    d.display_name,
+                    d.glibc,
+                    d.glibcxx,
+                    if d.supports_dt_relr { "yes" } else { "no" }
+                );
+            }
+            out
+        }
+        OutputFormat::Json => {
+            let mut out = String::new();
+            let _ = writeln!(out, "{{");
+            let _ = writeln!(out, "  \"tool\": \"bincompat\",");
+            let _ = writeln!(out, "  \"version\": {},", json_str(VERSION_STR));
+            let _ = writeln!(out, "  \"targets\": [");
+            for (idx, d) in DISTRO_BASELINES.iter().enumerate() {
+                let comma = if idx + 1 < DISTRO_BASELINES.len() {
+                    ","
+                } else {
+                    ""
+                };
+                let _ = writeln!(out, "    {{");
+                let _ = writeln!(out, "      \"id\": {},", json_str(d.id));
+                let _ = writeln!(out, "      \"display_name\": {},", json_str(d.display_name));
+                let _ = writeln!(out, "      \"glibc\": {},", json_str(d.glibc));
+                let _ = writeln!(out, "      \"glibcxx\": {},", json_str(d.glibcxx));
+                let _ = writeln!(out, "      \"supports_dt_relr\": {}", d.supports_dt_relr);
+                let _ = writeln!(out, "    }}{comma}");
+            }
+            let _ = writeln!(out, "  ]");
+            let _ = writeln!(out, "}}");
+            out
+        }
+        OutputFormat::Markdown | OutputFormat::Sarif => {
+            let mut out = String::new();
+            let _ = writeln!(out, "## bincompat targets\n");
+            let _ = writeln!(out, "| Target | Distro | GLIBC | GLIBCXX | DT_RELR |");
+            let _ = writeln!(out, "| :--- | :--- | :--- | :--- | :--- |");
+            for d in DISTRO_BASELINES {
+                let _ = writeln!(
+                    out,
+                    "| `{}` | {} | `{}` | `{}` | {} |",
+                    d.id,
+                    d.display_name,
+                    d.glibc,
+                    d.glibcxx,
+                    if d.supports_dt_relr { "yes" } else { "no" }
+                );
+            }
+            out
+        }
     }
 }
 

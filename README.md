@@ -31,11 +31,17 @@ bincompat check ./build/app \
 
 # Fail CI if a new build adds DT_NEEDED entries, raises symbol version floors, adds RPATH/ABI tags, or drops hardening
 bincompat diff ./releases/v1/app ./build/app
+
+# Write SARIF directly to a file for GitHub Code Scanning uploads
+bincompat check ./build/app --target rhel-8 --format sarif -o bincompat.sarif
+
+# List built-in Linux distro baselines (text, json, or markdown)
+bincompat targets
 ```
 
-All three commands accept `--format text|json|markdown|sarif` (SARIF 2.1.0 emits rules `BC001`..`BC007` for `check` and `BC101`..`BC105` for `diff`).
+All report commands accept `--format text|json|markdown|sarif` and `-o` / `--out <FILE>` (SARIF 2.1.0 emits rules `BC001`..`BC007` for `check` and `BC101`..`BC105` for `diff`).
 
-Built-in `--target` presets: `rhel-8` (`rocky-8`, `manylinux_2_28`), `ubuntu-20.04`, `debian-11`, `rhel-9`, `ubuntu-22.04`, `debian-12`, `ubuntu-24.04`, and `debian-13`.
+Built-in `--target` presets: `centos-7` (`manylinux2014`, `rhel-7`), `rhel-8` (`rocky-8`, `manylinux_2_28`), `ubuntu-20.04`, `debian-11`, `rhel-9`, `ubuntu-22.04`, `debian-12`, `ubuntu-24.04`, `rhel-10` (`rocky-10`), and `debian-13`.
 
 Exit codes: `0` pass, `1` policy violation or diff regression, `2` usage, I/O, or malformed ELF error.
 
