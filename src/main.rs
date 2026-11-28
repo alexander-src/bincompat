@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use bincompat::{
-    analyze_file, diff_analyses, render_check, render_diff, render_scan, BincompatError,
-    OutputFormat, Policy, Result, Version,
+    analyze_file, diff_analyses, render_check, render_diff, render_scan, render_targets,
+    BincompatError, OutputFormat, Policy, Result, Version,
 };
 
 const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
@@ -15,17 +16,19 @@ const USAGE: &str = "\
 bincompat - Zero-dependency ELF64 Linux binary portability and hardening CI gate
 
 USAGE:
-  bincompat scan <path> [--format text|json|markdown|sarif]
-  bincompat check <path> [options]
-  bincompat diff <baseline> <candidate> [--format text|json|markdown|sarif]
+  bincompat scan <path> [--format text|json|markdown|sarif] [--out <FILE>]
+  bincompat check <path> [options] [--out <FILE>]
+  bincompat diff <baseline> <candidate> [--format text|json|markdown|sarif] [--out <FILE>]
+  bincompat targets [--format text|json|markdown] [--out <FILE>]
   bincompat --help | --version
 
 GLOBAL OPTIONS:
   --format <FMT>               Output format: text (default), json, markdown, sarif
+  -o, --out <FILE>             Write report to FILE instead of stdout
 
 CHECK OPTIONS:
-  --target <DISTRO>            Apply distro preset (rhel-8, ubuntu-20.04, debian-11,
-                               rhel-9, ubuntu-22.04, debian-12, ubuntu-24.04, debian-13)
+  --target <DISTRO>            Apply distro preset (centos-7, rhel-8, ubuntu-20.04, debian-11,
+                               rhel-9, ubuntu-22.04, debian-12, ubuntu-24.04, rhel-10, debian-13)
   --max-glibc <VER>            Fail if any symbol requires GLIBC > VER (e.g. 2.28)
   --max-glibcxx <VER>          Fail if any symbol requires GLIBCXX > VER (e.g. 3.4.28)
   --max-version <PREFIX=VER>   Fail if PREFIX version exceeds VER (repeatable)
@@ -46,19 +49,26 @@ EXIT CODES:
 enum Command {
     Help,
     Version,
+    Targets {
+        format: OutputFormat,
+        out: Option<PathBuf>,
+    },
     Scan {
         path: PathBuf,
         format: OutputFormat,
+        out: Option<PathBuf>,
     },
     Check {
         path: PathBuf,
         policy: Policy,
         format: OutputFormat,
+        out: Option<PathBuf>,
     },
     Diff {
         baseline: PathBuf,
         candidate: PathBuf,
         format: OutputFormat,
+        out: Option<PathBuf>,
     },
 }
 
@@ -73,6 +83,19 @@ fn main() -> ExitCode {
     }
 }
 
+fn emit_output(rendered: &str, out: Option<&Path>) -> Result<()> {
+    match out {
+        Some(path) => fs::write(path, rendered).map_err(|source| BincompatError::WriteIo {
+            path: path.to_path_buf(),
+            source,
+        }),
+        None => {
+            print!("{rendered}");
+            Ok(())
+        }
+    }
+}
+
 fn run(args: &[String]) -> Result<u8> {
     match parse_args(args)? {
         Command::Help => {
@@ -83,37 +106,44 @@ fn run(args: &[String]) -> Result<u8> {
             println!("bincompat {VERSION_STR}");
             Ok(0)
         }
-        Command::Scan { path, format } => {
+        Command::Targets { format, out } => {
+            let rendered = render_targets(format);
+            emit_output(&rendered, out.as_deref())?;
+            Ok(0)
+        }
+        Command::Scan { path, format, out } => {
             let analysis = analyze_file(&path)?;
             let label = path.display().to_string();
-            print!("{}", render_scan(format, &label, &analysis));
+            let rendered = render_scan(format, &label, &analysis);
+            emit_output(&rendered, out.as_deref())?;
             Ok(0)
         }
         Command::Check {
             path,
             policy,
             format,
+            out,
         } => {
             let analysis = analyze_file(&path)?;
             let eval = policy.evaluate(&analysis);
             let label = path.display().to_string();
-            print!(
-                "{}",
-                render_check(format, &label, &analysis, &policy, &eval)
-            );
+            let rendered = render_check(format, &label, &analysis, &policy, &eval);
+            emit_output(&rendered, out.as_deref())?;
             Ok(if eval.passed { 0 } else { 1 })
         }
         Command::Diff {
             baseline,
             candidate,
             format,
+            out,
         } => {
             let base_analysis = analyze_file(&baseline)?;
             let cand_analysis = analyze_file(&candidate)?;
             let diff = diff_analyses(&base_analysis, &cand_analysis);
             let base_label = baseline.display().to_string();
             let cand_label = candidate.display().to_string();
-            print!("{}", render_diff(format, &base_label, &cand_label, &diff));
+            let rendered = render_diff(format, &base_label, &cand_label, &diff);
+            emit_output(&rendered, out.as_deref())?;
             Ok(if diff.passed { 0 } else { 1 })
         }
     }
@@ -122,7 +152,7 @@ fn run(args: &[String]) -> Result<u8> {
 fn parse_args(args: &[String]) -> Result<Command> {
     if args.is_empty() {
         return Err(BincompatError::InvalidArgument(
-            "missing subcommand (expected 'scan', 'check', or 'diff'; run --help for usage)"
+            "missing subcommand (expected 'scan', 'check', 'diff', or 'targets'; run --help for usage)"
                 .to_string(),
         ));
     }
@@ -130,18 +160,19 @@ fn parse_args(args: &[String]) -> Result<Command> {
     match args[0].as_str() {
         "-h" | "--help" | "help" => Ok(Command::Help),
         "-V" | "--version" => Ok(Command::Version),
+        "targets" => parse_targets_args(&args[1..]),
         "scan" => parse_scan_args(&args[1..]),
         "check" => parse_check_args(&args[1..]),
         "diff" => parse_diff_args(&args[1..]),
         other => Err(BincompatError::InvalidArgument(format!(
-            "unknown subcommand '{other}' (expected 'scan', 'check', or 'diff')"
+            "unknown subcommand '{other}' (expected 'scan', 'check', 'diff', or 'targets')"
         ))),
     }
 }
 
-fn parse_scan_args(args: &[String]) -> Result<Command> {
-    let mut path: Option<PathBuf> = None;
+fn parse_targets_args(args: &[String]) -> Result<Command> {
     let mut format = OutputFormat::Text;
+    let mut out: Option<PathBuf> = None;
     let mut idx = 0usize;
 
     while idx < args.len() {
@@ -150,6 +181,50 @@ fn parse_scan_args(args: &[String]) -> Result<Command> {
             "--format" => {
                 let raw = next_value(args, &mut idx, "--format")?;
                 format = OutputFormat::parse(raw)?;
+                if format == OutputFormat::Sarif {
+                    return Err(BincompatError::InvalidArgument(
+                        "targets does not support --format sarif (expected text, json, or markdown)"
+                            .to_string(),
+                    ));
+                }
+            }
+            flag @ ("-o" | "--out") => {
+                let raw = next_value(args, &mut idx, flag)?;
+                out = Some(PathBuf::from(raw));
+            }
+            flag if flag.starts_with('-') => {
+                return Err(BincompatError::InvalidArgument(format!(
+                    "unknown option '{flag}'"
+                )));
+            }
+            positional => {
+                return Err(BincompatError::InvalidArgument(format!(
+                    "unexpected positional argument '{positional}' for targets"
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(Command::Targets { format, out })
+}
+
+fn parse_scan_args(args: &[String]) -> Result<Command> {
+    let mut path: Option<PathBuf> = None;
+    let mut format = OutputFormat::Text;
+    let mut out: Option<PathBuf> = None;
+    let mut idx = 0usize;
+
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--format" => {
+                let raw = next_value(args, &mut idx, "--format")?;
+                format = OutputFormat::parse(raw)?;
+            }
+            flag @ ("-o" | "--out") => {
+                let raw = next_value(args, &mut idx, flag)?;
+                out = Some(PathBuf::from(raw));
             }
             flag if flag.starts_with('-') => {
                 return Err(BincompatError::InvalidArgument(format!(
@@ -170,16 +245,18 @@ fn parse_scan_args(args: &[String]) -> Result<Command> {
 
     let path = path.ok_or_else(|| {
         BincompatError::InvalidArgument(
-            "usage: bincompat scan <path> [--format text|json|markdown|sarif]".to_string(),
+            "usage: bincompat scan <path> [--format text|json|markdown|sarif] [--out <FILE>]"
+                .to_string(),
         )
     })?;
-    Ok(Command::Scan { path, format })
+    Ok(Command::Scan { path, format, out })
 }
 
 fn parse_diff_args(args: &[String]) -> Result<Command> {
     let mut baseline: Option<PathBuf> = None;
     let mut candidate: Option<PathBuf> = None;
     let mut format = OutputFormat::Text;
+    let mut out: Option<PathBuf> = None;
     let mut idx = 0usize;
 
     while idx < args.len() {
@@ -188,6 +265,10 @@ fn parse_diff_args(args: &[String]) -> Result<Command> {
             "--format" => {
                 let raw = next_value(args, &mut idx, "--format")?;
                 format = OutputFormat::parse(raw)?;
+            }
+            flag @ ("-o" | "--out") => {
+                let raw = next_value(args, &mut idx, flag)?;
+                out = Some(PathBuf::from(raw));
             }
             flag if flag.starts_with('-') => {
                 return Err(BincompatError::InvalidArgument(format!(
@@ -211,7 +292,7 @@ fn parse_diff_args(args: &[String]) -> Result<Command> {
 
     let (Some(baseline), Some(candidate)) = (baseline, candidate) else {
         return Err(BincompatError::InvalidArgument(
-            "usage: bincompat diff <baseline> <candidate> [--format text|json|markdown|sarif]"
+            "usage: bincompat diff <baseline> <candidate> [--format text|json|markdown|sarif] [--out <FILE>]"
                 .to_string(),
         ));
     };
@@ -219,6 +300,7 @@ fn parse_diff_args(args: &[String]) -> Result<Command> {
         baseline,
         candidate,
         format,
+        out,
     })
 }
 
@@ -226,6 +308,7 @@ fn parse_check_args(args: &[String]) -> Result<Command> {
     let mut path: Option<PathBuf> = None;
     let mut policy = Policy::default();
     let mut format = OutputFormat::Text;
+    let mut out: Option<PathBuf> = None;
     let mut idx = 0usize;
 
     while idx < args.len() {
@@ -234,6 +317,10 @@ fn parse_check_args(args: &[String]) -> Result<Command> {
             "--format" => {
                 let raw = next_value(args, &mut idx, "--format")?;
                 format = OutputFormat::parse(raw)?;
+            }
+            flag @ ("-o" | "--out") => {
+                let raw = next_value(args, &mut idx, flag)?;
+                out = Some(PathBuf::from(raw));
             }
             "--target" => {
                 let raw = next_value(args, &mut idx, "--target")?;
@@ -320,6 +407,7 @@ fn parse_check_args(args: &[String]) -> Result<Command> {
         path,
         policy,
         format,
+        out,
     })
 }
 

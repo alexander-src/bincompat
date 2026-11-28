@@ -6,6 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub enum BincompatError {
     Io { path: PathBuf, source: io::Error },
+    WriteIo { path: PathBuf, source: io::Error },
     InvalidElf(String),
     UnsupportedClass(u8),
     UnsupportedEndianness(u8),
@@ -20,6 +21,9 @@ impl fmt::Display for BincompatError {
         match self {
             Self::Io { path, source } => {
                 write!(f, "failed to read '{}': {}", path.display(), source)
+            }
+            Self::WriteIo { path, source } => {
+                write!(f, "failed to write '{}': {}", path.display(), source)
             }
             Self::InvalidElf(msg) => write!(f, "invalid ELF file: {msg}"),
             Self::UnsupportedClass(class) => {
@@ -45,7 +49,7 @@ impl fmt::Display for BincompatError {
 impl std::error::Error for BincompatError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::WriteIo { source, .. } => Some(source),
             _ => None,
         }
     }

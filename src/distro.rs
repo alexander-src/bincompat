@@ -14,6 +14,13 @@ pub struct DistroBaseline {
 /// Built-in reference baselines for common LTS and enterprise Linux distributions.
 pub const DISTRO_BASELINES: &[DistroBaseline] = &[
     DistroBaseline {
+        id: "centos-7",
+        display_name: "CentOS / RHEL 7 (manylinux2014)",
+        glibc: "2.17",
+        glibcxx: "3.4.19",
+        supports_dt_relr: false,
+    },
+    DistroBaseline {
         id: "rhel-8",
         display_name: "RHEL / Rocky 8",
         glibc: "2.28",
@@ -63,6 +70,13 @@ pub const DISTRO_BASELINES: &[DistroBaseline] = &[
         supports_dt_relr: true,
     },
     DistroBaseline {
+        id: "rhel-10",
+        display_name: "RHEL / Rocky 10",
+        glibc: "2.39",
+        glibcxx: "3.4.33",
+        supports_dt_relr: true,
+    },
+    DistroBaseline {
         id: "debian-13",
         display_name: "Debian 13",
         glibc: "2.41",
@@ -83,8 +97,13 @@ pub struct DistroCompatibility {
 pub fn lookup_distro(spec: &str) -> Option<DistroBaseline> {
     let normalized = spec.trim().to_ascii_lowercase().replace('_', "-");
     let canonical = match normalized.as_str() {
+        "centos-7" | "centos7" | "rhel-7" | "rhel7" | "el7" | "manylinux2014"
+        | "manylinux-2-17" => "centos-7",
         "rhel-8" | "rhel8" | "rocky-8" | "rocky8" | "alma-8" | "el8" | "manylinux-2-28" => "rhel-8",
         "rhel-9" | "rhel9" | "rocky-9" | "rocky9" | "alma-9" | "el9" | "manylinux-2-34" => "rhel-9",
+        "rhel-10" | "rhel10" | "rocky-10" | "rocky10" | "alma-10" | "el10" | "manylinux-2-39" => {
+            "rhel-10"
+        }
         "ubuntu-20.04" | "ubuntu20.04" | "focal" => "ubuntu-20.04",
         "ubuntu-22.04" | "ubuntu22.04" | "jammy" => "ubuntu-22.04",
         "ubuntu-24.04" | "ubuntu24.04" | "noble" => "ubuntu-24.04",
@@ -148,11 +167,15 @@ mod tests {
 
     #[test]
     fn resolves_canonical_and_alias_targets() {
+        assert_eq!(lookup_distro("centos-7").unwrap().glibc, "2.17");
+        assert_eq!(lookup_distro("manylinux2014").unwrap().id, "centos-7");
         assert_eq!(lookup_distro("rhel-8").unwrap().glibc, "2.28");
         assert_eq!(lookup_distro("rocky-8").unwrap().id, "rhel-8");
         assert_eq!(lookup_distro("manylinux_2_28").unwrap().id, "rhel-8");
         assert_eq!(lookup_distro("Ubuntu-22.04").unwrap().glibc, "2.35");
         assert_eq!(lookup_distro("bookworm").unwrap().id, "debian-12");
+        assert_eq!(lookup_distro("rocky-10").unwrap().id, "rhel-10");
+        assert_eq!(lookup_distro("rhel-10").unwrap().glibcxx, "3.4.33");
         assert!(lookup_distro("unknown-os").is_none());
     }
 }
